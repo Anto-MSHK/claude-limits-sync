@@ -1,0 +1,22 @@
+name = "claude-limits"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Секреты (не в этом файле!):  npx wrangler secret put API_TOKEN / BOT_TOKEN
+[vars]
+TZ_NAME = "Europe/Moscow"
+
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "LimitsHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LimitsHub"]
+
+# Проверка уведомлений каждые 10 минут
+[triggers]
+crons = ["*/10 * * * *"]
+
+[observability]
+enabled = true
