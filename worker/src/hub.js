@@ -1,11 +1,27 @@
 import { DurableObject } from 'cloudflare:workers';
 import {
   migrate, applyReport, expireHolds, view, poolView, dueNotifications, participants, allDevices,
-  findDevice, renameDevice, poolMeta, NAME_MAX,
+  findDevice, renameDevice, poolMeta, adjustShare, NAME_MAX, POOL_META,
 } from './logic.js';
 import { renderLimits, renderHistory, renderNotification, renderDevices, esc } from './format.js';
 
-const defaultCfg = () => ({ owner: null, notify_week: true, notify_5h: true, pending_rename: null });
+// Владельцы бота: любой Telegram-аккаунт, приславший /start <API_TOKEN>. У каждого свои настройки.
+//   cfg.owners = { "<chatId>": { notify_week, notify_5h, pending_rename, since } }
+const defaultOwner = (now) => ({ notify_week: true, notify_5h: true, pending_rename: null, since: now });
+
+function migrateCfg(c) {
+  const cfg = { owners: {}, ...(c ?? {}) };
+  if (cfg.owner != null) { // старый формат: один владелец и общие настройки
+    cfg.owners[String(cfg.owner)] = {
+      ...defaultOwner(0), notify_week: cfg.notify_week ?? true, notify_5h: cfg.notify_5h ?? true,
+    };
+    delete cfg.owner; delete cfg.notify_week; delete cfg.notify_5h; delete cfg.pending_rename;
+  }
+  return cfg;
+}
+
+// Уведомление → какая настройка владельца его включает.
+const NOTE_FLAG = (key) => (key.startsWith('5h') ? 'notify_5h' : 'notify_week');
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 const REFRESH_KB = { inline_keyboard: [[{ text: '🔄 Обновить', callback_data: 'refresh' }]] };
@@ -17,7 +33,7 @@ export class LimitsHub extends DurableObject {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       this.s = migrate(await ctx.storage.get('state'));
-      this.cfg = { ...defaultCfg(), ...((await ctx.storage.get('cfg')) ?? {}) };
+      this.cfg = migrateCfg(await ctx.storage.get('cfg'));
     });
   }
 
@@ -49,17 +65,39 @@ export class LimitsHub extends DurableObject {
     return this.current();
   }
 
+  // Ручная корректировка доли: { pool, device (id или имя), value: число | 'rest', kind? }
+  async adjust({ pool, device, value, kind }) {
+    const poolId = this.findPool(pool);
+    if (!poolId) return { error: 'нет такого пула' };
+    const id = findDevice(this.s, device);
+    if (!id) return { error: 'нет такой машины' };
+    const res = adjustShare(this.s, poolId, id, value === 'rest' ? 'rest' : Number(value), kind || 'seven_day');
+    if (!res.error) await this.save();
+    return { pool: poolId, device: id, ...res };
+  }
+
+  findPool(q) {
+    const k = String(q ?? '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    if (this.s.pools[k]) return k;
+    return Object.keys(this.s.pools).find((id) => (POOL_META[id]?.title ?? id).toLowerCase().replace(/[^a-z0-9_-]/g, '') === k) ?? null;
+  }
+
   async tick() {
     const now = nowSec();
     expireHolds(this.s, now);
-    const notes = dueNotifications(this.s, this.cfg, now);
+    // Отмечаем уведомления отправленными один раз, а кому слать — решают настройки каждого владельца.
+    const notes = dueNotifications(this.s, { notify_week: true, notify_5h: true }, now);
     await this.save();
-    if (!this.cfg.owner) return { sent: 0, skipped: notes.length };
+    let sent = 0;
     for (const n of notes) {
       const text = renderNotification(n, participants(this.s, n.pool), poolMeta(n.pool).title, this.tz);
-      await this.send(this.cfg.owner, text, REFRESH_KB);
+      for (const [chatId, o] of Object.entries(this.cfg.owners)) {
+        if (!o[NOTE_FLAG(n.key)]) continue;
+        await this.send(chatId, text, REFRESH_KB);
+        sent++;
+      }
     }
-    return { sent: notes.length };
+    return { notes: notes.length, sent };
   }
 
   // --- Telegram ---------------------------------------------------------------
@@ -79,12 +117,16 @@ export class LimitsHub extends DurableObject {
     return this.tg('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...(markup ? { reply_markup: markup } : {}) });
   }
 
-  settingsMarkup() {
+  owner(chatId) {
+    return this.cfg.owners[String(chatId)] ?? null;
+  }
+
+  settingsMarkup(o) {
     const mark = (on) => (on ? '✅' : '❌');
     return {
       inline_keyboard: [
-        [{ text: `${mark(this.cfg.notify_week)} Неделя: напоминания перед сбросом`, callback_data: 'tog:week' }],
-        [{ text: `${mark(this.cfg.notify_5h)} 5 часов: напоминание за 30 мин`, callback_data: 'tog:5h' }],
+        [{ text: `${mark(o.notify_week)} Неделя: напоминания перед сбросом`, callback_data: 'tog:week' }],
+        [{ text: `${mark(o.notify_5h)} 5 часов: напоминание за 30 мин`, callback_data: 'tog:5h' }],
       ],
     };
   }
@@ -101,7 +143,8 @@ export class LimitsHub extends DurableObject {
       await this.send(chatId, `Не подошло. Имя: 1–${NAME_MAX} символов, без &lt; &gt; &amp; и кавычек, и не должно совпадать с именем другой машины.`);
       return false;
     }
-    this.cfg.pending_rename = null;
+    const o = this.owner(chatId);
+    if (o) o.pending_rename = null;
     await this.save();
     await this.send(chatId, `✅ <b>${esc(old)}</b> → <b>${esc(name)}</b>\nВ статус-лайнах обновится со следующего отчёта.`);
     return true;
@@ -114,30 +157,37 @@ export class LimitsHub extends DurableObject {
     const chatId = msg.chat.id;
     const text = msg.text.trim();
 
-    if (!this.cfg.owner) {
-      // Привязка владельца: /start <API_TOKEN> — токен знает только хозяин.
-      const [cmd, arg] = text.split(/\s+/);
-      if (cmd === '/start' && arg && arg === this.env.API_TOKEN) {
-        this.cfg.owner = chatId;
-        await this.save();
-        await this.send(chatId, '✅ Бот привязан к тебе. /limits — лимиты, /devices — машины, /settings — уведомления.');
-      } else {
-        await this.send(chatId, 'Бот не привязан. Отправь: /start &lt;API_TOKEN&gt;');
-      }
-      return;
-    }
-    if (chatId !== this.cfg.owner) return; // чужим не отвечаем
-
-    // Ждём новое имя после нажатия кнопки в /rename
-    if (this.cfg.pending_rename && !text.startsWith('/')) {
-      await this.doRename(chatId, this.cfg.pending_rename, text);
-      return;
-    }
-
     const m = text.match(/^(\/\w+)(?:@\w+)?\s*(.*)$/s);
     const cmd = (m?.[1] ?? '').toLowerCase();
     const rest = (m?.[2] ?? '').trim();
-    if (this.cfg.pending_rename && cmd) { this.cfg.pending_rename = null; await this.save(); }
+
+    // Привязка: /start <API_TOKEN> добавляет аккаунт в владельцы (их может быть сколько угодно).
+    if (cmd === '/start' && rest) {
+      if (rest !== this.env.API_TOKEN) {
+        await this.send(chatId, '❌ Неверный токен.');
+        return;
+      }
+      const already = !!this.owner(chatId);
+      if (!already) this.cfg.owners[String(chatId)] = defaultOwner(nowSec());
+      await this.save();
+      await this.send(chatId, `${already ? 'ℹ️ Этот аккаунт уже привязан.' : '✅ Аккаунт привязан.'}\n`
+        + `Привязано аккаунтов: ${Object.keys(this.cfg.owners).length}.\n`
+        + 'Удали сообщение с токеном из чата. /help — команды.');
+      return;
+    }
+
+    const o = this.owner(chatId);
+    if (!o) {
+      await this.send(chatId, 'Этот аккаунт не привязан. Отправь: <code>/start API_TOKEN</code>');
+      return;
+    }
+
+    // Ждём новое имя после нажатия кнопки в /rename
+    if (o.pending_rename && !text.startsWith('/')) {
+      await this.doRename(chatId, o.pending_rename, text);
+      return;
+    }
+    if (o.pending_rename && cmd) { o.pending_rename = null; await this.save(); }
 
     switch (cmd) {
       case '/start':
@@ -147,7 +197,27 @@ export class LimitsHub extends DurableObject {
           + '/devices — машины\n'
           + '/rename — переименовать машину\n'
           + '/history — прошлые недели\n'
-          + '/settings — уведомления');
+          + '/settings — уведомления (у каждого аккаунта свои)\n'
+          + '/unlink — отвязать этот аккаунт');
+        break;
+      case '/assign': { // скрытая команда: нет в меню и /help
+        const w = rest.split(/\s+/);
+        if (w.length < 3) {
+          await this.send(chatId, 'Формат: <code>/assign пул машина проценты</code> или <code>/assign пул машина rest</code>\n'
+            + `Пулы: ${Object.keys(this.s.pools).join(', ')}`);
+          return;
+        }
+        const value = w[w.length - 1].toLowerCase().replace(',', '.');
+        const r = await this.adjust({ pool: w[0], device: w.slice(1, -1).join(' '), value: value === 'rest' ? 'rest' : value });
+        if (r.error) { await this.send(chatId, `❌ ${esc(r.error)}`); return; }
+        await this.send(chatId, '✅ Готово. Сейчас:', null);
+        await this.send(chatId, renderLimits(this.current(), this.tz), REFRESH_KB);
+        break;
+      }
+      case '/unlink':
+        delete this.cfg.owners[String(chatId)];
+        await this.save();
+        await this.send(chatId, '👋 Аккаунт отвязан. Привязать снова: <code>/start API_TOKEN</code>');
         break;
       case '/limits':
       case '/l':
@@ -179,7 +249,7 @@ export class LimitsHub extends DurableObject {
         })), this.tz));
         break;
       case '/settings':
-        await this.send(chatId, '🔔 Уведомления', this.settingsMarkup());
+        await this.send(chatId, '🔔 Уведомления для этого аккаунта', this.settingsMarkup(o));
         break;
       default:
         await this.send(chatId, renderLimits(this.current(), this.tz), REFRESH_KB);
@@ -189,7 +259,8 @@ export class LimitsHub extends DurableObject {
   async onCallback(q) {
     const chatId = q.message?.chat?.id;
     const answer = (text) => this.tg('answerCallbackQuery', { callback_query_id: q.id, ...(text ? { text } : {}) });
-    if (!this.cfg.owner || chatId !== this.cfg.owner) return answer();
+    const o = this.owner(chatId);
+    if (!o) return answer('Аккаунт не привязан');
 
     if (q.data === 'refresh') {
       await this.tg('editMessageText', {
@@ -200,16 +271,16 @@ export class LimitsHub extends DurableObject {
     }
     if (q.data === 'tog:week' || q.data === 'tog:5h') {
       const key = q.data === 'tog:week' ? 'notify_week' : 'notify_5h';
-      this.cfg[key] = !this.cfg[key];
+      o[key] = !o[key];
       await this.save();
-      await this.tg('editMessageReplyMarkup', { chat_id: chatId, message_id: q.message.message_id, reply_markup: this.settingsMarkup() });
-      return answer(this.cfg[key] ? 'Включено' : 'Выключено');
+      await this.tg('editMessageReplyMarkup', { chat_id: chatId, message_id: q.message.message_id, reply_markup: this.settingsMarkup(o) });
+      return answer(o[key] ? 'Включено' : 'Выключено');
     }
     if (q.data?.startsWith('ren:')) {
       const id = q.data.slice(4);
       const p = allDevices(this.s).find((x) => x.id === id);
       if (!p) return answer('Машина не найдена');
-      this.cfg.pending_rename = id;
+      o.pending_rename = id;
       await this.save();
       await this.send(chatId, `Пришли новое имя для <b>${esc(p.name)}</b> (до ${NAME_MAX} символов). Отмена — любая команда.`);
       return answer();

@@ -56,6 +56,7 @@ async function setup(req, env) {
       { command: 'rename', description: 'Переименовать машину' },
       { command: 'history', description: 'Прошлые недели' },
       { command: 'settings', description: 'Уведомления' },
+      { command: 'unlink', description: 'Отвязать этот аккаунт' },
     ],
   });
   const me = await call('getMe', {});
@@ -83,6 +84,12 @@ export default {
       }
       if (pathname === '/state' && req.method === 'GET') return json(await hub(env).state());
       if (pathname === '/tick' && req.method === 'POST') return json(await hub(env).tick());
+      if (pathname === '/adjust' && req.method === 'POST') {
+        const body = await req.json().catch(() => null);
+        if (!body || typeof body !== 'object') return json({ error: 'bad body' }, 400);
+        const r = await hub(env).adjust(body);
+        return json(r, r.error ? 400 : 200);
+      }
       if (pathname === '/setup' && req.method === 'POST') return json(await setup(req, env));
       return json({ error: 'not found' }, 404);
     } catch (e) {

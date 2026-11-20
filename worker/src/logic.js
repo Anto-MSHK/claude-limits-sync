@@ -22,11 +22,14 @@ export const POOL_RE = /^[a-z0-9_-]{1,16}$/;
 export const MAX_POOLS = 6;
 
 // Подписи пулов. Неизвестный пул тоже работает — просто называется своим id.
+// lag — сколько секунд после последних трат машины необъяснённый прирост ещё считается её «хвостом».
+//   Claude: лимит в заголовках ответа обновляется сразу → 0, необъяснённое = claude.ai / телефон.
+//   Z.ai: кредиты списываются с задержкой, а квота опрашивается раз в минуту → хвост до 20 минут.
 export const POOL_META = {
-  claude: { title: 'Claude', web: 'web / телефон', webShort: 'web' },
-  zai: { title: 'Z.ai', web: 'другие клиенты', webShort: 'др' },
+  claude: { title: 'Claude', web: 'web / телефон', webShort: 'web', lag: 0 },
+  zai: { title: 'Z.ai', web: 'другие клиенты', webShort: 'др', lag: 1200 },
 };
-export const poolMeta = (id) => POOL_META[id] ?? { title: id, web: 'другое', webShort: 'др' };
+export const poolMeta = (id) => POOL_META[id] ?? { title: id, web: 'другое', webShort: 'др', lag: 0 };
 
 const SAME_WINDOW = 1800;          // resets_at может «плавать»; ближе 30 минут считаем тем же окном
 const HOLD_TTL = 600;              // сколько ждать трат, прежде чем отдать необъяснённый прирост в web
@@ -74,6 +77,7 @@ function distribute(w, delta, now) {
   if (amount <= EPS) return;
   if (P > EPS) {
     for (const [d, c] of Object.entries(w.pend)) add(w.alloc, d, (amount * c) / P);
+    w.lastw = { ...w.pend }; // веса последней раздачи — для «хвостов» с задержкой
     w.pend = {};
     w.hold = 0;
   } else {
@@ -83,14 +87,60 @@ function distribute(w, delta, now) {
 }
 
 export function expireHolds(s, now) {
-  for (const p of Object.values(s.pools)) {
+  for (const [poolId, p] of Object.entries(s.pools)) {
+    const lag = poolMeta(poolId).lag;
     for (const w of Object.values(p.windows)) {
       if (w.hold > EPS && now - w.hold_t > HOLD_TTL) {
-        add(w.alloc, WEB, w.hold);
+        // Хвост с задержкой: отдаём машинам, которые тратили незадолго до появления прироста.
+        const recent = lag > 0
+          ? Object.entries(w.lastw || {}).filter(([d]) => (w.act?.[d] ?? -Infinity) >= w.hold_t - lag)
+          : [];
+        const W = recent.reduce((a, [, c]) => a + c, 0);
+        if (W > EPS) for (const [d, c] of recent) add(w.alloc, d, (w.hold * c) / W);
+        else add(w.alloc, WEB, w.hold);
         w.hold = 0;
       }
     }
   }
+}
+
+/**
+ * Ручная корректировка доли машины в окне (по умолчанию — неделя).
+ *   target: число — сделать долю ровно такой; 'rest' — отдать машине всё «ранее» и «web/др».
+ * Добавка берётся из «ранее», затем из web, затем пропорционально у других машин; излишек уходит в «ранее».
+ */
+export function adjustShare(s, poolId, dev, target, kind = 'seven_day') {
+  const w = s.pools[poolId]?.windows[kind];
+  if (!w) return { error: 'нет такого окна' };
+  if (!s.devices[dev]) return { error: 'нет такой машины' };
+  const before = { ...w.alloc };
+  if (target === 'rest') {
+    const amount = (w.alloc[PRIOR] || 0) + (w.alloc[WEB] || 0) + w.hold;
+    add(w.alloc, dev, amount);
+    delete w.alloc[PRIOR]; delete w.alloc[WEB];
+    w.hold = 0;
+  } else {
+    const t = num(target);
+    if (t === null || t < 0 || t > w.total + EPS) return { error: `доля должна быть от 0 до ${r1(w.total)}` };
+    let diff = t - (w.alloc[dev] || 0);
+    if (diff < 0) add(w.alloc, PRIOR, -diff);
+    for (const src of [PRIOR, WEB]) {
+      if (diff <= EPS) break;
+      const take = Math.min(diff, w.alloc[src] || 0);
+      w.alloc[src] = (w.alloc[src] || 0) - take; diff -= take;
+    }
+    if (diff > EPS) {
+      const others = Object.entries(w.alloc).filter(([d, v]) => d !== dev && d !== PRIOR && d !== WEB && v > EPS);
+      const O = others.reduce((a, [, v]) => a + v, 0);
+      const take = Math.min(diff, O);
+      for (const [d, v] of others) w.alloc[d] -= (take * v) / O;
+      diff -= take;
+    }
+    w.alloc[dev] = t - Math.max(0, diff);
+  }
+  for (const [d, v] of Object.entries(w.alloc)) if (v <= EPS) delete w.alloc[d];
+  w.baselines[dev] = true; // ручная правка важнее старой оценки
+  return { before, after: { ...w.alloc } };
 }
 
 function archive(p, kind, w) {
@@ -150,7 +200,7 @@ export function applyReport(s, r, now) {
     if (!w) continue;
     if (now >= w.resets_at + 60 && !fresh) continue; // окно истекло, а новое ещё не пришло
 
-    if (dc > EPS) add(w.pend, dev, dc);
+    if (dc > EPS) { add(w.pend, dev, dc); (w.act ||= {})[dev] = now; }
     if (fresh && pct > w.total + EPS) {
       const delta = pct - w.total;
       w.total = pct;

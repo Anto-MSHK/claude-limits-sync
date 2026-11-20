@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { emptyState, applyReport, view, dueNotifications, expireHolds, participants, renameDevice, findDevice, cleanName, migrate } from '../src/logic.js';
+import { emptyState, applyReport, view, dueNotifications, expireHolds, participants, renameDevice, findDevice, cleanName, migrate, adjustShare } from '../src/logic.js';
 
 const R7 = 2_000_000_000; // resets_at недельного окна
 const R5 = 1_999_990_000;
@@ -212,4 +212,54 @@ test('уведомления несут пул', () => {
   applyReport(s, { ...rep('Mac', 'z', 0, 40), pool: 'zai' }, 1000);
   const n = dueNotifications(s, { notify_week: true }, R7 - 3 * 3600);
   assert.deepEqual(n.map((x) => [x.pool, x.key]), [['zai', 'week_6h']]);
+});
+
+test('zai: прирост с задержкой достаётся машине, которая недавно тратила, а не «др»', () => {
+  const s = emptyState();
+  const z = (d, sid, c, p, t) => applyReport(s, { ...rep(d, sid, c, p), pool: 'zai' }, t);
+  z('Mac', 'a', 0, 10, 1000);
+  z('Mac', 'a', 2, 11, 1060);   // часть списания видна сразу — раздали, pend пуст
+  z('Win', 'b', 0, 13, 1300);   // хвост +2% проявился позже, трат нет
+  expireHolds(s, 1300 + 601);
+  close(s.pools.zai.windows.seven_day.alloc.Mac, 3);
+  assert.equal(s.pools.zai.windows.seven_day.alloc.web, undefined);
+});
+
+test('claude: тот же сценарий остаётся web (лимит обновляется без задержки)', () => {
+  const s = emptyState();
+  applyReport(s, rep('Mac', 'a', 0, 10), 1000);
+  applyReport(s, rep('Mac', 'a', 2, 11), 1060);
+  applyReport(s, rep('Win', 'b', 0, 13), 1300);
+  expireHolds(s, 1300 + 601);
+  close(s.pools.claude.windows.seven_day.alloc.web, 2);
+});
+
+test('zai: давние траты не забирают хвост — уходит в «др»', () => {
+  const s = emptyState();
+  const z = (d, sid, c, p, t) => applyReport(s, { ...rep(d, sid, c, p), pool: 'zai' }, t);
+  z('Mac', 'a', 0, 10, 1000);
+  z('Mac', 'a', 2, 11, 1060);
+  z('Win', 'b', 0, 13, 1060 + 3600); // через час
+  expireHolds(s, 1060 + 3600 + 601);
+  close(s.pools.zai.windows.seven_day.alloc.web, 2);
+});
+
+test('ручная корректировка: точная доля и «остальное»', () => {
+  const s = emptyState();
+  const z = (d, sid, c, p, t) => applyReport(s, { ...rep(d, sid, c, p), pool: 'zai' }, t);
+  z('Mac', 'a', 0, 77.2, 1000);   // prior 77.2
+  z('Win', 'b', 0, 77.2, 1001);
+  z('Mac', 'a', 1, 82.7, 1010);   // Mac +5.5
+  s.pools.zai.windows.seven_day.alloc.web = 0.3; s.pools.zai.windows.seven_day.alloc.Mac = 5.2;
+  adjustShare(s, 'zai', 'Win', 22);
+  const a = s.pools.zai.windows.seven_day.alloc;
+  close(a.Win, 22); close(a.prior, 55.2);
+  adjustShare(s, 'zai', 'Mac', 'rest');
+  close(a.Mac, 60.7); assert.equal(a.prior, undefined); assert.equal(a.web, undefined);
+  close(a.Mac + a.Win, 82.7);
+  // уменьшение доли возвращает излишек в «ранее»
+  adjustShare(s, 'zai', 'Win', 20);
+  close(a.Win, 20); close(a.prior, 2);
+  assert.ok(adjustShare(s, 'zai', 'Win', 99).error);
+  assert.ok(adjustShare(s, 'zai', 'Nope', 1).error);
 });
